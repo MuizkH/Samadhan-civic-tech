@@ -1,0 +1,20 @@
+# Samadhan — only the landing page and the public transparency dashboard are
+# reachable without signing in. Everything else is behind auth and would just
+# serve crawlers an empty shell, so it is disallowed rather than wasting crawl
+# budget on redirects to the sign-in page.
+
+User-agent: *
+Allow: /$
+Allow: /transparency
+Disallow: /dashboard
+Disallow: /admin
+Disallow: /profile
+Disallow: /documents
+Disallow: /report
+Disallow: /schemes
+Disallow: /analyzer
+Disallow: /signin
+Disallow: /signup
+Disallow: /map
+
+Sitemap: https://samadhan.gov.in/sitemap.xml

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <!--
+      Defaults for the landing page and for any crawler that reads the shell
+      before React runs. PageMeta overwrites these per route on mount; the two
+      public routes (/ and /transparency) are also prerendered at build time,
+      so their real tags are already in the served HTML.
+    -->
+    <title>Samadhan — Report civic issues and track how they get fixed</title>
+    <meta
+      name="description"
+      content="Report potholes, water supply failures, streetlight outages and sanitation problems to the right municipal department, then follow the work order until it is resolved."
+    />
+    <meta name="author" content="Samadhan" />
+    <link rel="canonical" href="https://samadhan.gov.in/" />
+
+    <meta property="og:title" content="Samadhan — Report civic issues and track how they get fixed" />
+    <meta
+      property="og:description"
+      content="Report potholes, water supply failures, streetlight outages and sanitation problems to the right municipal department, then follow the work order until it is resolved."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://samadhan.gov.in/" />
+    <meta property="og:image" content="https://samadhan.gov.in/og-image.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:site" content="@Samadhan" />
+    <meta name="twitter:title" content="Samadhan — Report civic issues and track how they get fixed" />
+    <meta
+      name="twitter:description"
+      content="Report potholes, water supply failures, streetlight outages and sanitation problems to the right municipal department, then follow the work order until it is resolved."
+    />
+    <meta name="twitter:image" content="https://samadhan.gov.in/og-image.png" />
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

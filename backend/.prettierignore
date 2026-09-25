@@ -1,0 +1,6 @@
+node_modules
+dist
+coverage
+package-lock.json
+# Prisma owns the formatting of migrations and the generated client
+prisma/migrations

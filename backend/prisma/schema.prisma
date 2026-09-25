@@ -1,0 +1,554 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  directUrl  = env("DIRECT_URL")
+  extensions = [postgis]
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  citizen
+  dept_admin
+  super_admin
+}
+
+enum IssueStatus {
+  reported
+  acknowledged
+  in_progress
+  resolved
+  verified
+  rejected
+  reopened
+  closed
+}
+
+enum WorkOrderRole {
+  primary
+  supporting
+  notify
+}
+
+enum WorkOrderStatus {
+  pending
+  acknowledged
+  in_progress
+  done
+  rejected
+}
+
+enum DependencyType {
+  finish_to_start
+  start_to_start
+}
+
+enum NoteVisibility {
+  internal
+  inter_dept
+  citizen
+}
+
+enum TransferStatus {
+  requested
+  approved
+  rejected
+  cancelled
+}
+
+enum NotificationChannel {
+  in_app
+  email
+}
+
+enum NotificationStatus {
+  pending
+  sent
+  failed
+}
+
+// ---------------------------------------------------------------------------
+// Departments & categories — routing is data-driven, never if/else chains
+// ---------------------------------------------------------------------------
+
+model Department {
+  id        String   @id @default(uuid()) @db.Uuid
+  code      String   @unique
+  nameEn    String   @map("name_en")
+  nameHi    String   @map("name_hi")
+  parentId  String?  @map("parent_id") @db.Uuid
+  parent    Department?  @relation("DepartmentToParent", fields: [parentId], references: [id])
+  children  Department[] @relation("DepartmentToParent")
+  contact   String?
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  categoryRules      CategoryDepartmentRule[]
+  defaultForCategory IssueCategory[]          @relation("CategoryDefaultDepartment")
+  users              User[]
+  workOrders         WorkOrder[]
+  slaPolicies        SlaPolicy[]
+  transfersFrom      WorkOrderTransfer[] @relation("TransferFrom")
+  transfersTo        WorkOrderTransfer[] @relation("TransferTo")
+
+  @@map("departments")
+}
+
+model IssueCategory {
+  id                     String   @id @default(uuid()) @db.Uuid
+  code                   String   @unique
+  nameEn                 String   @map("name_en")
+  nameHi                 String   @map("name_hi")
+  defaultDepartmentId    String   @map("default_department_id") @db.Uuid
+  defaultDepartment      Department @relation("CategoryDefaultDepartment", fields: [defaultDepartmentId], references: [id])
+  defaultPriority        Int      @default(3) @map("default_priority")
+  dedupRadiusM           Int      @default(75) @map("dedup_radius_m")
+  dedupWindowHours       Int      @default(72) @map("dedup_window_hours")
+  active                 Boolean  @default(true)
+  createdAt              DateTime @default(now()) @map("created_at")
+
+  departmentRules CategoryDepartmentRule[]
+  issues          Issue[]
+  slaPolicies     SlaPolicy[]
+
+  @@map("issue_categories")
+}
+
+// Data-driven routing table: for a given category, which department(s) get
+// a work order and in what role. Adding/changing routing is a data change,
+// never a code change.
+model CategoryDepartmentRule {
+  id           String        @id @default(uuid()) @db.Uuid
+  categoryId   String        @map("category_id") @db.Uuid
+  category     IssueCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  departmentId String        @map("department_id") @db.Uuid
+  department   Department    @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+  role         WorkOrderRole
+  priority     Int           @default(3)
+
+  @@unique([categoryId, departmentId, role])
+  @@map("category_department_rules")
+}
+
+// ---------------------------------------------------------------------------
+// Users
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String     @id @default(uuid()) @db.Uuid
+  email        String     @unique
+  passwordHash String     @map("password_hash")
+  fullName     String     @map("full_name")
+  phone        String?
+  role         UserRole   @default(citizen)
+  departmentId String?    @map("department_id") @db.Uuid
+  department   Department? @relation(fields: [departmentId], references: [id])
+  /// Municipal jurisdiction a staff account works in. Scopes every read a
+  /// dept_admin makes to their own city; null on super_admin (state-wide)
+  /// and on citizens (who are scoped by authorship, not geography).
+  city         String?
+  createdAt    DateTime   @default(now()) @map("created_at")
+
+  reportedIssues     Issue[]         @relation("IssueReportedBy")
+  resolvedIssues     Issue[]         @relation("IssueResolvedBy")
+  issueReports       IssueReport[]
+  uploadedMedia      IssueMedia[]
+  assignedWorkOrders WorkOrder[]     @relation("WorkOrderAssignee")
+  statusHistoryEntries IssueStatusHistory[]
+  auditLogEntries    AuditLog[]
+  verifications      CitizenVerification[]
+  coordinationOverrides CoordinationPlan[]
+  createdDependencies WorkOrderDependency[]
+  workOrderNotes     WorkOrderNote[]
+  transfersRequested WorkOrderTransfer[] @relation("TransferRequestedBy")
+  transfersApproved  WorkOrderTransfer[] @relation("TransferApprovedBy")
+  escalationsNotified Escalation[]
+  notifications      Notification[]
+  notificationPreference NotificationPreference?
+
+  @@index([departmentId, role])
+  @@index([city])
+  @@map("users")
+}
+
+// ---------------------------------------------------------------------------
+// Issues — the core civic-report entity
+// ---------------------------------------------------------------------------
+
+model Issue {
+  id              String      @id @default(uuid()) @db.Uuid
+  publicRef       String      @unique @map("public_ref")
+  title           String
+  description     String
+  categoryId      String      @map("category_id") @db.Uuid
+  category        IssueCategory @relation(fields: [categoryId], references: [id])
+  status          IssueStatus @default(reported)
+  // PostGIS geography point (lon, lat), SRID 4326
+  location        Unsupported("geography(Point, 4326)")
+  address         String?
+  /// Municipal jurisdiction that owns this issue, denormalised from the
+  /// reverse-geocoded address so it can be indexed and filtered. Staff reads
+  /// are scoped on this column.
+  city            String?
+  priority        Int         @default(3)
+  reportedBy      String      @map("reported_by") @db.Uuid
+  reporter        User        @relation("IssueReportedBy", fields: [reportedBy], references: [id])
+  dedupClusterId  String?     @map("dedup_cluster_id") @db.Uuid
+  supportsCount   Int         @default(0) @map("supports_count")
+  resolutionNote  String?     @map("resolution_note")
+  resolvedById    String?     @map("resolved_by") @db.Uuid
+  resolvedByUser  User?       @relation("IssueResolvedBy", fields: [resolvedById], references: [id])
+  reopenCount     Int         @default(0) @map("reopen_count")
+  /// What the model suggested at report time, kept beside what the citizen chose
+  aiSuggestedCategory String? @map("ai_suggested_category")
+  aiSuggestedPriority Int?    @map("ai_suggested_priority")
+  aiSuggestionConfidence Float? @map("ai_suggestion_confidence")
+  createdAt       DateTime    @default(now()) @map("created_at")
+  acknowledgedAt  DateTime?   @map("acknowledged_at")
+  resolvedAt      DateTime?   @map("resolved_at")
+  verifiedAt      DateTime?   @map("verified_at")
+  closedAt        DateTime?   @map("closed_at")
+
+  reports        IssueReport[]
+  media          IssueMedia[]
+  workOrders     WorkOrder[]
+  statusHistory  IssueStatusHistory[]
+  supports       IssueSupport[]
+  verifications  CitizenVerification[]
+  coordinationPlans CoordinationPlan[]
+
+  @@index([categoryId, status, createdAt])
+  @@index([city, status, createdAt])
+  @@map("issues")
+}
+
+// Citizen confirm/dispute vote on whether an issue is real, one per
+// (issue, user). Replaces the previous localStorage-only implementation.
+model CitizenVerification {
+  id        String   @id @default(uuid()) @db.Uuid
+  issueId   String   @map("issue_id") @db.Uuid
+  issue     Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  userId    String   @map("user_id") @db.Uuid
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// true = confirms the issue is real, false = disputes it
+  vote      Boolean
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@unique([issueId, userId])
+  @@index([issueId])
+  @@map("citizen_verifications")
+}
+
+// A citizen "support" (upvote) on an issue — one per user per issue.
+model IssueSupport {
+  id        String   @id @default(uuid()) @db.Uuid
+  issueId   String   @map("issue_id") @db.Uuid
+  issue     Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  userId    String   @map("user_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@unique([issueId, userId])
+  @@map("issue_supports")
+}
+
+// Every citizen report against an issue — the first is is_primary; later
+// reports of the same issue (deduped) still get recorded here.
+model IssueReport {
+  id          String   @id @default(uuid()) @db.Uuid
+  issueId     String   @map("issue_id") @db.Uuid
+  issue       Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  reporterId  String   @map("reporter_id") @db.Uuid
+  reporter    User     @relation(fields: [reporterId], references: [id])
+  description String
+  isPrimary   Boolean  @default(false) @map("is_primary")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([issueId])
+  @@map("issue_reports")
+}
+
+enum MediaKind {
+  evidence
+  resolution_proof
+}
+
+model IssueMedia {
+  id         String    @id @default(uuid()) @db.Uuid
+  issueId    String    @map("issue_id") @db.Uuid
+  issue      Issue     @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  kind       MediaKind
+  url        String
+  publicId   String    @map("public_id")
+  uploadedBy String    @map("uploaded_by") @db.Uuid
+  uploader   User      @relation(fields: [uploadedBy], references: [id])
+  /// { match, confidence, detectedLabel, reason, promptVersion } — advisory only
+  aiVerification Json?  @map("ai_verification")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  @@index([issueId])
+  @@map("issue_media")
+}
+
+// ---------------------------------------------------------------------------
+// Work orders — one per (issue, department, role) from category_department_rules
+// ---------------------------------------------------------------------------
+
+model WorkOrder {
+  id           String          @id @default(uuid()) @db.Uuid
+  issueId      String          @map("issue_id") @db.Uuid
+  issue        Issue           @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  departmentId String          @map("department_id") @db.Uuid
+  department   Department      @relation(fields: [departmentId], references: [id])
+  role         WorkOrderRole
+  status       WorkOrderStatus @default(pending)
+  assigneeId   String?         @map("assignee_id") @db.Uuid
+  assignee     User?           @relation("WorkOrderAssignee", fields: [assigneeId], references: [id])
+  priority     Int             @default(3)
+  sequence     Int             @default(0)
+  createdAt    DateTime        @default(now()) @map("created_at")
+  completedAt  DateTime?       @map("completed_at")
+
+  // SLA tracking
+  slaPolicyId     String?    @map("sla_policy_id") @db.Uuid
+  slaPolicy       SlaPolicy? @relation(fields: [slaPolicyId], references: [id])
+  ackDueAt        DateTime?  @map("ack_due_at")
+  dueAt           DateTime?  @map("due_at")
+  acknowledgedAt  DateTime?  @map("acknowledged_at")
+  startedAt       DateTime?  @map("started_at")
+  breachedAt      DateTime?  @map("breached_at")
+  escalationLevel Int        @default(0) @map("escalation_level")
+
+  statusHistory IssueStatusHistory[]
+  dependsOn     WorkOrderDependency[] @relation("DependencySuccessor")
+  blocks        WorkOrderDependency[] @relation("DependencyPredecessor")
+  notes         WorkOrderNote[]
+  transfers     WorkOrderTransfer[]
+  escalations   Escalation[]
+
+  @@index([departmentId, status])
+  @@index([dueAt])
+  @@index([breachedAt])
+  @@map("work_orders")
+}
+
+/// Resolved most-specific-first: an exact (category, department, priority)
+/// row beats a category-wide default.
+model SlaPolicy {
+  id                String        @id @default(uuid()) @db.Uuid
+  categoryId        String?       @map("category_id") @db.Uuid
+  category          IssueCategory? @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  departmentId      String?       @map("department_id") @db.Uuid
+  department        Department?   @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+  priority          Int?
+  ackMinutes        Int           @map("ack_minutes")
+  resolveMinutes    Int           @map("resolve_minutes")
+  businessHoursOnly Boolean       @default(false) @map("business_hours_only")
+  /// Ordered [{ level, afterMinutes, notifyRole }]
+  escalationChain   Json          @default("[]") @map("escalation_chain")
+  active            Boolean       @default(true)
+  createdAt         DateTime      @default(now()) @map("created_at")
+
+  workOrders WorkOrder[]
+
+  @@map("sla_policies")
+}
+
+model WorkOrderDependency {
+  id            String         @id @default(uuid()) @db.Uuid
+  predecessorId String         @map("predecessor_id") @db.Uuid
+  predecessor   WorkOrder      @relation("DependencyPredecessor", fields: [predecessorId], references: [id], onDelete: Cascade)
+  successorId   String         @map("successor_id") @db.Uuid
+  successor     WorkOrder      @relation("DependencySuccessor", fields: [successorId], references: [id], onDelete: Cascade)
+  type          DependencyType @default(finish_to_start)
+  createdById   String?        @map("created_by") @db.Uuid
+  createdBy     User?          @relation(fields: [createdById], references: [id])
+  createdAt     DateTime       @default(now()) @map("created_at")
+
+  @@unique([predecessorId, successorId])
+  @@index([successorId])
+  @@map("work_order_dependencies")
+}
+
+model WorkOrderNote {
+  id          String         @id @default(uuid()) @db.Uuid
+  workOrderId String         @map("work_order_id") @db.Uuid
+  workOrder   WorkOrder      @relation(fields: [workOrderId], references: [id], onDelete: Cascade)
+  authorId    String         @map("author_id") @db.Uuid
+  author      User           @relation(fields: [authorId], references: [id])
+  body        String
+  visibility  NoteVisibility @default(internal)
+  createdAt   DateTime       @default(now()) @map("created_at")
+
+  @@index([workOrderId, createdAt])
+  @@map("work_order_notes")
+}
+
+model WorkOrderTransfer {
+  id                 String         @id @default(uuid()) @db.Uuid
+  workOrderId        String         @map("work_order_id") @db.Uuid
+  workOrder          WorkOrder      @relation(fields: [workOrderId], references: [id], onDelete: Cascade)
+  fromDepartmentId   String         @map("from_department_id") @db.Uuid
+  fromDepartment     Department     @relation("TransferFrom", fields: [fromDepartmentId], references: [id])
+  toDepartmentId     String         @map("to_department_id") @db.Uuid
+  toDepartment       Department     @relation("TransferTo", fields: [toDepartmentId], references: [id])
+  reason             String
+  requestedById      String         @map("requested_by") @db.Uuid
+  requestedBy        User           @relation("TransferRequestedBy", fields: [requestedById], references: [id])
+  approvedById       String?        @map("approved_by") @db.Uuid
+  approvedBy         User?          @relation("TransferApprovedBy", fields: [approvedById], references: [id])
+  status             TransferStatus @default(requested)
+  decisionNote       String?        @map("decision_note")
+  createdAt          DateTime       @default(now()) @map("created_at")
+  decidedAt          DateTime?      @map("decided_at")
+
+  @@index([workOrderId])
+  @@index([toDepartmentId, status])
+  @@map("work_order_transfers")
+}
+
+model Escalation {
+  id              String    @id @default(uuid()) @db.Uuid
+  workOrderId     String    @map("work_order_id") @db.Uuid
+  workOrder       WorkOrder @relation(fields: [workOrderId], references: [id], onDelete: Cascade)
+  level           Int
+  reason          String
+  breachedAt      DateTime  @map("breached_at")
+  overdueMinutes  Int       @map("overdue_minutes")
+  notifiedUserId  String?   @map("notified_user_id") @db.Uuid
+  notifiedUser    User?     @relation(fields: [notifiedUserId], references: [id])
+  acknowledgedAt  DateTime? @map("acknowledged_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+
+  @@unique([workOrderId, level])
+  @@index([createdAt])
+  @@map("escalations")
+}
+
+model Notification {
+  id          String              @id @default(uuid()) @db.Uuid
+  recipientId String              @map("recipient_id") @db.Uuid
+  recipient   User                @relation(fields: [recipientId], references: [id], onDelete: Cascade)
+  channel     NotificationChannel @default(in_app)
+  template    String
+  payload     Json                @default("{}")
+  status      NotificationStatus  @default(pending)
+  error       String?
+  sentAt      DateTime?           @map("sent_at")
+  readAt      DateTime?           @map("read_at")
+  createdAt   DateTime            @default(now()) @map("created_at")
+
+  @@index([recipientId, readAt])
+  @@index([status])
+  @@map("notifications")
+}
+
+model NotificationPreference {
+  id            String   @id @default(uuid()) @db.Uuid
+  userId        String   @unique @map("user_id") @db.Uuid
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  inAppEnabled  Boolean  @default(true) @map("in_app_enabled")
+  emailEnabled  Boolean  @default(true) @map("email_enabled")
+  statusChanges Boolean  @default(true) @map("status_changes")
+  assignments   Boolean  @default(true)
+  slaAlerts     Boolean  @default(true) @map("sla_alerts")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("notification_preferences")
+}
+
+// ---------------------------------------------------------------------------
+// Append-only history & audit trail — never updated, only inserted
+// ---------------------------------------------------------------------------
+
+model IssueStatusHistory {
+  id          String       @id @default(uuid()) @db.Uuid
+  issueId     String       @map("issue_id") @db.Uuid
+  issue       Issue        @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  workOrderId String?      @map("work_order_id") @db.Uuid
+  workOrder   WorkOrder?   @relation(fields: [workOrderId], references: [id])
+  fromStatus  String?      @map("from_status")
+  toStatus    String       @map("to_status")
+  actorId     String       @map("actor_id") @db.Uuid
+  actor       User         @relation(fields: [actorId], references: [id])
+  actorRole   UserRole     @map("actor_role")
+  reason      String?
+  createdAt   DateTime     @default(now()) @map("created_at")
+
+  @@index([issueId, createdAt])
+  @@map("issue_status_history")
+}
+
+model AuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  actorId    String?  @map("actor_id") @db.Uuid
+  actor      User?    @relation(fields: [actorId], references: [id])
+  action     String
+  entityType String   @map("entity_type")
+  entityId   String   @map("entity_id")
+  before     Json?
+  after      Json?
+  ipHash     String?  @map("ip_hash")
+  at         DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@map("audit_log")
+}
+
+// ── AI layer ───────────────────────────────────────────────────────────────
+
+/// Every model call, for cost/latency reporting and for auditing what the
+/// platform asked and what came back. Written whether the call succeeded,
+/// failed over, or failed outright.
+model AiCall {
+  id           String   @id @default(uuid()) @db.Uuid
+  kind         String
+  provider     String
+  model        String
+  promptVersion String  @map("prompt_version")
+  entityType   String?  @map("entity_type")
+  entityId     String?  @map("entity_id") @db.Uuid
+  latencyMs    Int      @map("latency_ms")
+  promptTokens Int?     @map("prompt_tokens")
+  outputTokens Int?     @map("output_tokens")
+  ok           Boolean  @default(true)
+  error        String?
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([kind, createdAt])
+  @@map("ai_calls")
+}
+
+/// The immutable reasoning behind an automated multi-department plan.
+/// This is the RTI / accountability artifact: it records what the model was
+/// asked, what it proposed, and whether a human overrode it.
+model CoordinationPlan {
+  id            String   @id @default(uuid()) @db.Uuid
+  issueId       String   @map("issue_id") @db.Uuid
+  issue         Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  provider      String
+  model         String
+  promptVersion String   @map("prompt_version")
+  /// Ordered subtasks + dependencies exactly as the model returned them.
+  plan          Json
+  rationale     String
+  confidence    Float
+  /// applied = work orders created, suggested = below threshold, awaiting a human
+  status        String   @default("suggested")
+  appliedAt     DateTime? @map("applied_at")
+  overriddenById String? @map("overridden_by") @db.Uuid
+  overriddenBy  User?    @relation(fields: [overriddenById], references: [id])
+  overrideNote  String?  @map("override_note")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@index([issueId])
+  @@map("coordination_plans")
+}
